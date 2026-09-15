@@ -1,0 +1,125 @@
+# Zet je app live op de hosting van softwaremaken.nl.
+#
+# Draait bij elke push naar `main`: bouwt op GitHub (composer, npm) en zet het
+# resultaat via SSH neer op je eigen hostingomgeving. De secrets (DEPLOY_*)
+# zet het platform voor je klaar als je op "Zet live" klikt; je hoeft ze niet
+# zelf aan te maken. Meer uitleg: https://softwaremaken.nl/leren/live-zetten
+name: Zet live
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: zet-live
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  zet-live:
+    name: Bouwen en live zetten
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Code ophalen
+        uses: actions/checkout@v4
+
+      - name: Controle op geheimen in de code
+        run: |
+          set -e
+          if git ls-files | grep -qx '.env'; then
+            echo '::error::Je .env staat in de repository. Haal hem eruit (git rm --cached .env) en zet geheimen alleen op de hostingomgeving.'; exit 1
+          fi
+          if git ls-files -z | xargs -0 grep -lE '(sk_live_[0-9a-zA-Z]{10,}|live_[0-9a-zA-Z]{30,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY-----)' 2>/dev/null | grep -v '^\.github/' ; then
+            echo '::error::Er lijkt een sleutel of wachtwoord in de code te staan. Verwijder die en zet hem in je .env op de hostingomgeving.'; exit 1
+          fi
+          if [ ! -f composer.json ] || ! grep -q '"laravel/framework"' composer.json; then
+            echo '::error::Dit is geen Laravel-project (geen laravel/framework in composer.json). De hosting van softwaremaken.nl draait alleen Laravel.'; exit 1
+          fi
+
+      - name: PHP klaarzetten
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, intl, pdo_mysql, bcmath, gd, zip
+          coverage: none
+          tools: composer:v2
+
+      - name: Composer-pakketten installeren
+        run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+
+      - name: Node klaarzetten
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Assets bouwen
+        if: hashFiles('package.json') != ''
+        run: |
+          npm ci
+          npm run build
+
+      - name: SSH-sleutel klaarzetten
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${DEPLOY_PORT:-7685}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Bestanden overzetten
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p ${DEPLOY_PORT:-7685} -o StrictHostKeyChecking=yes" \
+            --exclude '.git' --exclude '.github' --exclude 'node_modules' --exclude 'tests' \
+            --exclude '.env' --exclude 'storage/app/**' --exclude 'storage/logs/**' --exclude 'storage/framework/cache/**' --exclude 'storage/framework/sessions/**' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:~/app/"
+
+      - name: Migraties en cache op de hosting
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "${DEPLOY_PORT:-7685}" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+            set -e
+            cd ~/app
+            mkdir -p storage/app/public storage/logs storage/framework/cache/data storage/framework/sessions storage/framework/views bootstrap/cache
+            chmod -R u+rwX storage bootstrap/cache
+            if [ ! -f .env ]; then
+              echo 'Geen .env op de hostingomgeving; het platform zet die klaar bij "Zet live".'; exit 1
+            fi
+            if ! grep -q '^APP_KEY=base64:' .env; then php artisan key:generate --force; fi
+            php artisan migrate --force
+            php artisan storage:link >/dev/null 2>&1 || true
+            php artisan optimize
+            # Documentroot: public_html wijst naar app/public
+            for d in ~/domains/*/; do
+              if [ -d "$d" ] && [ ! -L "$d/public_html" ]; then rm -rf "$d/public_html" && ln -s ../../app/public "$d/public_html"; fi
+            done
+            echo 'Live.'
+          REMOTE
+
+      - name: Status melden aan softwaremaken.nl
+        if: always()
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+          DEPLOY_WEBHOOK_TOKEN: ${{ secrets.DEPLOY_WEBHOOK_TOKEN }}
+        run: |
+          [ -z "$DEPLOY_WEBHOOK_URL" ] && exit 0
+          curl -sS -m 15 -X POST "$DEPLOY_WEBHOOK_URL" \
+            -H "Authorization: Bearer $DEPLOY_WEBHOOK_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"status\":\"${{ job.status }}\",\"commit\":\"${GITHUB_SHA}\",\"repository\":\"${GITHUB_REPOSITORY}\",\"run_id\":\"${GITHUB_RUN_ID}\",\"run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",\"ref\":\"${GITHUB_REF_NAME}\",\"message\":$(git log -1 --pretty=%s | jq -Rs .)}" || true
