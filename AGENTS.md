@@ -46,3 +46,7 @@ later zonder herbouw uit te breiden is.
   `php artisan schedule:run`); de queue via `queue:work --stop-when-empty` in
   diezelfde cron.
 - Loop je vast? https://softwaremaken.nl/hulp
+
+## Feedbacktool op proefversies
+
+Elke Blade-layout die je maakt (ook eigen layouts naast `welcome.blade.php`) bevat vlak voor `</body>` de regel `@include('partials.siteping')`. Die laadt alleen iets als `SITEPING_ENABLED=true` in `.env` staat: softwaremaken.nl zet dat bij een proefversie, zodat bezoekers direct op de pagina feedback kunnen achterlaten. Verwijder de include niet en zet de variabele niet zelf aan op productie.
